@@ -2,14 +2,14 @@ package ncbi
 
 import (
 	"context"
-	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes ncbi as a kit Domain: a driver that a multi-domain
+// domain.go exposes NCBI as a kit Domain: a driver that a multi-domain
 // host (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/ncbi-cli/ncbi"
@@ -19,12 +19,9 @@ import (
 // ncbi:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone ncbi binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the ncbi driver. It carries no state; the per-run client is
+// Domain is the NCBI driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
@@ -36,138 +33,196 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "ncbi",
-			Short:  "A command line for ncbi.",
-			Long: `A command line for ncbi.
+			Short:  "Read public NCBI data: PubMed articles, genes, and more.",
+			Long: `Read public NCBI data: PubMed articles, genes, and more.
 
-ncbi reads public ncbi data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+ncbi reads from the NCBI Entrez eUtils API, shapes it into clean records,
+and prints output that pipes into the rest of your tools. No API key required
+for up to 3 req/s; set NCBI_API_KEY for higher limits.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/ncbi-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `ncbi page` and
-	// `ant get ncbi://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// pubmed: search PubMed and return full Article records.
+	kit.Handle(app, kit.OpMeta{Name: "pubmed", Group: "read", List: true,
+		Summary: "Search PubMed and return article records",
+		Args:    []kit.Arg{{Name: "query", Help: "search terms", Variadic: true}}}, searchPubMed)
 
-	// List op: members of a page, the home of `ncbi links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// ncbi://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// gene: search NCBI Gene DB and return full Gene records.
+	kit.Handle(app, kit.OpMeta{Name: "gene", Group: "read", List: true,
+		Summary: "Search the Gene database and return gene records",
+		Args:    []kit.Arg{{Name: "query", Help: "search terms", Variadic: true}}}, searchGene)
+
+	// search: generic search across any NCBI database; returns IDs and count.
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", Single: true,
+		Summary: "Generic search across an NCBI database",
+		Args:    []kit.Arg{{Name: "query", Help: "search terms", Variadic: true}}}, genericSearch)
+
+	// article: fetch a single PubMed article by PMID.
+	kit.Handle(app, kit.OpMeta{Name: "article", Group: "read", Single: true,
+		Summary: "Fetch a PubMed article by PMID", URIType: "pmid", Resolver: true,
+		Args: []kit.Arg{{Name: "pmid", Help: "PubMed ID"}}}, getArticle)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the NCBI client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	ncfg := DefaultConfig()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		ncfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		ncfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		ncfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		ncfg.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClientWithConfig(ncfg), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type pubmedQuery struct {
+	Query  []string `kit:"arg,variadic" help:"search terms"`
+	Limit  int      `kit:"flag,inherit" help:"max results"`
+	Client *Client  `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type geneQuery struct {
+	Query  []string `kit:"arg,variadic" help:"search terms"`
+	Limit  int      `kit:"flag,inherit" help:"max results"`
+	Client *Client  `kit:"inject"`
+}
+
+type searchQuery struct {
+	Query  []string `kit:"arg,variadic" help:"search terms"`
+	DB     string   `kit:"flag" help:"NCBI database" default:"pubmed"`
+	Limit  int      `kit:"flag,inherit" help:"max results"`
+	Client *Client  `kit:"inject"`
+}
+
+type articleRef struct {
+	PMID   string  `kit:"arg" help:"PubMed ID"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchPubMed(ctx context.Context, in pubmedQuery, emit func(*Article) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	arts, err := in.Client.SearchPubMed(ctx, strings.Join(in.Query, " "), limit)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, a := range arts {
+		if err := emit(a); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func searchGene(ctx context.Context, in geneQuery, emit func(*Gene) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	genes, err := in.Client.SearchGenes(ctx, strings.Join(in.Query, " "), limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, g := range genes {
+		if err := emit(g); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func genericSearch(ctx context.Context, in searchQuery, emit func(*SearchResult) error) error {
+	db := in.DB
+	if db == "" {
+		db = "pubmed"
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	sr, err := in.Client.Search(ctx, db, strings.Join(in.Query, " "), limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(sr)
+}
+
+func getArticle(ctx context.Context, in articleRef, emit func(*Article) error) error {
+	art, err := in.Client.GetArticle(ctx, in.PMID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(art)
+}
+
 // --- Resolver: the URI-native string functions, pure and network-free ---
 
-// Classify turns any accepted input — a bare path or a full ncbi.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// Classify turns any accepted input into the canonical (type, id).
+// A bare string of digits is a PMID; a full pubmed URL is also recognised.
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized ncbi reference: %q", input)
+	input = strings.TrimSpace(input)
+	// Full URL: https://pubmed.ncbi.nlm.nih.gov/<pmid>/
+	if strings.Contains(input, "pubmed.ncbi.nlm.nih.gov") {
+		parts := strings.Split(strings.Trim(input, "/"), "/")
+		for i := len(parts) - 1; i >= 0; i-- {
+			if isDigits(parts[i]) {
+				return "pmid", parts[i], nil
+			}
+		}
 	}
-	return "page", id, nil
+	// Bare PMID (all digits)
+	if isDigits(input) {
+		return "pmid", input, nil
+	}
+	return "", "", errs.Usage("unrecognized NCBI reference: %q (expected a PMID or pubmed URL)", input)
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "pmid":
+		return "https://pubmed.ncbi.nlm.nih.gov/" + id + "/", nil
+	default:
 		return "", errs.Usage("ncbi has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+// isDigits reports whether s is a non-empty string of ASCII digits.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
 	}
-	return strings.Trim(input, "/")
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// exit code.
 func mapErr(err error) error {
 	return err
 }
